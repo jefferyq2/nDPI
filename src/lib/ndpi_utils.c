@@ -34,6 +34,7 @@
 #include "ndpi_api.h"
 #include "ndpi_includes.h"
 #include "ndpi_encryption.h"
+#include "ndpi_private.h"
 
 #include "ahocorasick.h"
 #include "libcache.h"
@@ -62,12 +63,12 @@
 
 // #define DEBUG_REASSEMBLY
 
-#ifdef HAVE_PCRE
-#include <pcre.h>
+#ifdef HAVE_PCRE2
+#define PCRE2_CODE_UNIT_WIDTH 8
+#include <pcre2.h>
 
-struct pcre_struct {
-  pcre *compiled;
-  pcre_extra *optimized;
+struct pcre2_struct {
+  pcre2_code *compiled;
 };
 #endif
 
@@ -1244,6 +1245,7 @@ int ndpi_dpi2json(struct ndpi_detection_module_struct *ndpi_struct,
 		  ndpi_serializer *serializer) {
   char buf[64];
   char const *host_server_name;
+  char quic_version[16];
 
   if(flow == NULL) return(-1);
 
@@ -1372,16 +1374,6 @@ int ndpi_dpi2json(struct ndpi_detection_module_struct *ndpi_struct,
     ndpi_serialize_end_of_block(serializer);
     break;
 
-  case NDPI_PROTOCOL_STUN:
-    ndpi_serialize_start_of_block(serializer, "stun");
-    ndpi_serialize_string_uint32(serializer, "num_pkts", flow->stun.num_pkts);
-    ndpi_serialize_string_uint32(serializer, "num_binding_requests",
-                                 flow->stun.num_binding_requests);
-    ndpi_serialize_string_uint32(serializer, "num_processed_pkts",
-                                 flow->stun.num_processed_pkts);
-    ndpi_serialize_end_of_block(serializer);
-    break;
-
   case NDPI_PROTOCOL_TELNET:
     ndpi_serialize_start_of_block(serializer, "telnet");
     ndpi_serialize_string_string(serializer, "username", flow->protos.telnet.username);
@@ -1441,6 +1433,10 @@ int ndpi_dpi2json(struct ndpi_detection_module_struct *ndpi_struct,
     ndpi_serialize_start_of_block(serializer, "quic");
     if(flow->http.user_agent)
       ndpi_serialize_string_string(serializer, "user_agent", flow->http.user_agent);
+
+    ndpi_quic_version2str(quic_version, sizeof(quic_version),
+                          flow->protos.tls_quic.quic_version);
+    ndpi_serialize_string_string(serializer, "quic_version", quic_version);
 
     ndpi_tls2json(serializer, flow);
 
@@ -1707,18 +1703,19 @@ static int ndpi_is_xss_injection(char* query) {
 
 /* ********************************** */
 
-#ifdef HAVE_PCRE
+#ifdef HAVE_PCRE2
 
 static void ndpi_compile_rce_regex() {
-  const char *pcreErrorStr = NULL;
-  int pcreErrorOffset;
+  PCRE2_UCHAR pcreErrorStr[128];
+  PCRE2_SIZE pcreErrorOffset;
+  int pcreErrorCode;
 
   for(int i = 0; i < N_RCE_REGEX; i++) {
-    comp_rx[i] = (struct pcre_struct*)ndpi_malloc(sizeof(struct pcre_struct));
+    comp_rx[i] = (struct pcre2_struct*)ndpi_malloc(sizeof(struct pcre2_struct));
 
-    comp_rx[i]->compiled = pcre_compile(rce_regex[i], 0, &pcreErrorStr,
+    comp_rx[i]->compiled = pcre2_compile((PCRE2_SPTR)rce_regex[i], PCRE2_ZERO_TERMINATED, 0, &pcreErrorCode,
                                         &pcreErrorOffset, NULL);
-
+    pcre2_get_error_message(pcreErrorCode, pcreErrorStr, 128);
     if(comp_rx[i]->compiled == NULL) {
 #ifdef DEBUG
       NDPI_LOG_ERR(ndpi_str, "ERROR: Could not compile '%s': %s\n", rce_regex[i],
@@ -1728,18 +1725,19 @@ static void ndpi_compile_rce_regex() {
       continue;
     }
 
-    comp_rx[i]->optimized = pcre_study(comp_rx[i]->compiled, 0, &pcreErrorStr);
+    pcreErrorCode = pcre2_jit_compile(comp_rx[i]->compiled, PCRE2_JIT_COMPLETE);
 
 #ifdef DEBUG
-    if(pcreErrorStr != NULL) {
-      NDPI_LOG_ERR(ndpi_str, "ERROR: Could not study '%s': %s\n", rce_regex[i],
+    if(pcreErrorCode < 0) {
+      pcre2_get_error_message(pcreErrorCode, pcreErrorStr, 128);
+      NDPI_LOG_ERR(ndpi_str, "ERROR: Could not jit compile '%s': %s\n", rce_regex[i],
                    pcreErrorStr);
     }
 #endif
   }
-
-  ndpi_free((void *)pcreErrorStr);
 }
+
+/* ********************************** */
 
 static int ndpi_is_rce_injection(char* query) {
   if(!initialized_comp_rx) {
@@ -1747,17 +1745,17 @@ static int ndpi_is_rce_injection(char* query) {
     initialized_comp_rx = 1;
   }
 
+  pcre2_match_data *pcreMatchData;
   int pcreExecRet;
-  int subStrVec[30];
 
   for(int i = 0; i < N_RCE_REGEX; i++) {
     unsigned int length = strlen(query);
 
-    pcreExecRet = pcre_exec(comp_rx[i]->compiled,
-                            comp_rx[i]->optimized,
-                            query, length, 0, 0, subStrVec, 30);
-
-    if(pcreExecRet >= 0) {
+    pcreMatchData = pcre2_match_data_create_from_pattern(comp_rx[i]->compiled, NULL);
+    pcreExecRet = pcre2_match(comp_rx[i]->compiled,
+                            (PCRE2_SPTR)query, length, 0, 0, pcreMatchData, NULL);
+    pcre2_match_data_free(pcreMatchData);
+    if(pcreExecRet > 0) {
       return 1;
     }
 #ifdef DEBUG
@@ -1847,7 +1845,7 @@ ndpi_risk_enum ndpi_validate_url(char *url) {
 	    rc = NDPI_URL_POSSIBLE_XSS;
 	  else if(ndpi_is_sql_injection(decoded))
 	    rc = NDPI_URL_POSSIBLE_SQL_INJECTION;
-#ifdef HAVE_PCRE
+#ifdef HAVE_PCRE2
 	  else if(ndpi_is_rce_injection(decoded))
 	    rc = NDPI_URL_POSSIBLE_RCE_INJECTION;
 #endif
@@ -2054,8 +2052,10 @@ const char* ndpi_risk2str(ndpi_risk_enum risk) {
 
   case NDPI_TLS_ALPN_SNI_MISMATCH:
     return("ALPN/SNI Mismatch");
-    break;
-    
+
+  case NDPI_MALWARE_HOST_CONTACTED:
+    return("Client contacted a malware host");
+
   default:
     ndpi_snprintf(buf, sizeof(buf), "%d", (int)risk);
     return(buf);
@@ -2201,35 +2201,6 @@ ndpi_http_method ndpi_http_str2method(const char* method, u_int16_t method_len) 
 
 /* ******************************************************************** */
 
-#define ROR64(x,r) (((x)>>(r))|((x)<<(64-(r))))
-
-/*
-  'in_16_bytes_long` points to some 16 byte memory data to be hashed;
-  two independent 64-bit linear congruential generators are applied
-  results are mixed, scrambled and cast to 32-bit
-*/
-u_int32_t ndpi_quick_16_byte_hash(u_int8_t *in_16_bytes_long) {
-  u_int64_t a = *(u_int64_t*)(in_16_bytes_long + 0);
-  u_int64_t c = *(u_int64_t*)(in_16_bytes_long + 8);
-
-  // multipliers are taken from sprng.org, addends are prime
-  a = a * 0x2c6fe96ee78b6955 + 0x9af64480a3486659;
-  c = c * 0x369dea0f31a53f85 + 0xd0c6225445b76b5b;
-
-  // mix results
-  a += c;
-
-  // final scramble
-  a ^= ROR64(a, 13) ^ ROR64(a, 7);
-
-  // down-casting, also taking advantage of upper half
-  a ^= a >> 32;
-
-  return((u_int32_t)a);
-}
-
-/* ******************************************************************** */
-
 int ndpi_hash_init(ndpi_str_hash **h)
 {
   if (h == NULL)
@@ -2324,12 +2295,32 @@ static u_int64_t ndpi_host_ip_risk_ptree_match(struct ndpi_detection_module_stru
   ndpi_prefix_t prefix;
   ndpi_patricia_node_t *node;
 
-  if(!ndpi_str->protocols_ptree)
+  if(!ndpi_str->ip_risk_mask_ptree)
     return((u_int64_t)-1);
 
   /* Make sure all in network byte order otherwise compares wont work */
-  ndpi_fill_prefix_v4(&prefix, pin, 32, ((ndpi_patricia_tree_t *) ndpi_str->protocols_ptree)->maxbits);
+  ndpi_fill_prefix_v4(&prefix, pin, 32, ((ndpi_patricia_tree_t *) ndpi_str->ip_risk_mask_ptree)->maxbits);
   node = ndpi_patricia_search_best(ndpi_str->ip_risk_mask_ptree, &prefix);
+
+  if(node)
+    return(node->value.u.uv64);
+  else
+    return((u_int64_t)-1);
+}
+
+/* ********************************************************************************* */
+
+static u_int64_t ndpi_host_ip_risk_ptree_match6(struct ndpi_detection_module_struct *ndpi_str,
+					        struct in6_addr *pin6) {
+  ndpi_prefix_t prefix;
+  ndpi_patricia_node_t *node;
+
+  if(!ndpi_str->ip_risk_mask_ptree6)
+    return((u_int64_t)-1);
+
+  /* Make sure all in network byte order otherwise compares wont work */
+  ndpi_fill_prefix_v6(&prefix, pin6, 128, ((ndpi_patricia_tree_t *) ndpi_str->ip_risk_mask_ptree6)->maxbits);
+  node = ndpi_patricia_search_best(ndpi_str->ip_risk_mask_ptree6, &prefix);
 
   if(node)
     return(node->value.u.uv64);
@@ -2405,6 +2396,20 @@ static u_int8_t ndpi_check_ipv4_exception(struct ndpi_detection_module_struct *n
 
 /* ********************************************************************************* */
 
+static u_int8_t ndpi_check_ipv6_exception(struct ndpi_detection_module_struct *ndpi_str,
+					  struct ndpi_flow_struct *flow,
+					  struct in6_addr *addr) {
+  u_int64_t r;
+
+  r = ndpi_host_ip_risk_ptree_match6(ndpi_str, addr);
+
+  if(flow) flow->risk_mask &= r;
+
+  return((r != (u_int64_t)-1) ? 1 : 0);
+}
+
+/* ********************************************************************************* */
+
 void ndpi_handle_risk_exceptions(struct ndpi_detection_module_struct *ndpi_str,
 				 struct ndpi_flow_struct *flow) {
   if(flow->risk == 0) return; /* Nothing to do */
@@ -2441,11 +2446,13 @@ void ndpi_handle_risk_exceptions(struct ndpi_detection_module_struct *ndpi_str,
     }
   }
 
-  /* TODO: add IPv6 support */
   if(!flow->ip_risk_mask_evaluated) {
     if(flow->is_ipv6 == 0) {
       ndpi_check_ipv4_exception(ndpi_str, flow, flow->c_address.v4 /* Client */);
       ndpi_check_ipv4_exception(ndpi_str, flow, flow->s_address.v4 /* Server */);
+    } else {
+      ndpi_check_ipv6_exception(ndpi_str, flow, (struct in6_addr *)&flow->c_address.v6 /* Client */);
+      ndpi_check_ipv6_exception(ndpi_str, flow, (struct in6_addr *)&flow->s_address.v6 /* Server */);
     }
 
     flow->ip_risk_mask_evaluated = 1;
@@ -2459,6 +2466,7 @@ void ndpi_handle_risk_exceptions(struct ndpi_detection_module_struct *ndpi_str,
 void ndpi_set_risk(struct ndpi_detection_module_struct *ndpi_str,
 		   struct ndpi_flow_struct *flow, ndpi_risk_enum r,
 		   char *risk_message) {
+  if(!flow) return;
 
   /* Check if the risk is not yet set */
   if(!ndpi_isset_risk(ndpi_str, flow, r)) {
