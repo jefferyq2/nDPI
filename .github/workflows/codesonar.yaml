@@ -12,7 +12,7 @@ jobs:
     permissions: write-all
     runs-on: self-hosted
     container:
-      image: canuckmh/ndpi-cso-builder:7.4p0
+      image: canuckmh/ndpi-cso-builder:8.0p0
       credentials:
         username: ${{ secrets.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -60,4 +60,8 @@ jobs:
         uses: thollander/actions-comment-pull-request@v2
         with: 
           filePath: warnings.md
-            
+      - name: Upload SARIF results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: warnings.sarif
+          category: "CodeSecure CodeSonar"                 
